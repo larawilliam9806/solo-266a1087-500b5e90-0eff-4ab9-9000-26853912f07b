@@ -35,12 +35,12 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-@pytest.fixture(scope="session")
-def mock_base_url() -> str:
-    from mock_site.app import app as mock_app
+def _start_mock_server():
+    """在后台线程启动一个独立模拟站（独立 ControlState），返回 (base_url, server, thread)。"""
+    from mock_site.app import create_app
 
     port = _free_port()
-    config = uvicorn.Config(mock_app, host="127.0.0.1", port=port, log_level="warning")
+    config = uvicorn.Config(create_app(), host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
 
     def _serve() -> None:
@@ -61,7 +61,23 @@ def mock_base_url() -> str:
             time.sleep(0.1)
     else:
         raise RuntimeError("mock site failed to start")
+    return base, server, thread
+
+
+@pytest.fixture(scope="session")
+def mock_base_url() -> str:
+    base, server, thread = _start_mock_server()
     os.environ["MOCK_BASE_URL"] = base
+    yield base
+    server.should_exit = True
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "mock server thread did not stop"
+
+
+@pytest.fixture(scope="session")
+def mock_base_url_2() -> str:
+    """第二个独立模拟站：与 mock_base_url 不共享控制状态/计数器。"""
+    base, server, thread = _start_mock_server()
     yield base
     server.should_exit = True
     thread.join(timeout=10)

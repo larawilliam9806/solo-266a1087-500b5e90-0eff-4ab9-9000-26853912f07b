@@ -9,9 +9,15 @@
    即使暂停后“随即恢复”，恢复产生的是另一代 run_id，上一轮的迟到响应
    既改不了 permit_records 也改不了 tasks 进度。
 
-2. 每任务最多 2 个在途请求
-   每轮采集持有独立 asyncio.Semaphore(MAX_INFLIGHT)，所有 HTTP 请求
-   （目录页 + 详情）都先获取信号量；inflight 计数也在信号量保护区内维护。
+2. 每任务最多 2 个在途请求（名额属于任务，跨轮次共享）
+   每个任务一份 TaskSlots（asyncio.Semaphore(MAX_INFLIGHT) + inflight 计数），
+   从任务创建到进程结束保持不变，暂停/恢复均不重置、不重建。
+   公示站尚未返回的旧请求继续占用名额，直到 HTTP 真正结束才释放；
+   恢复产生的新一轮与旧轮次抢同一把信号量，只有名额空出才能发请求，
+   因此跨任意多次暂停/恢复，单任务未结束的目录/详情请求任何时刻
+   都不超过 MAX_INFLIGHT。进度接口读取同一份 inflight，
+   旧轮次仍在途的请求也会被计入。拿到名额后、真正发请求前还会再做
+   一次代际校验，保证暂停响应返回后旧轮次不会再发出新请求。
 
 3. 同任务并发恢复只能启动一轮
    每任务一把 asyncio.Lock（resume_locks），start/resume 临界区串行；
@@ -40,20 +46,45 @@ from . import config
 from .db import db
 
 
-class TaskControl:
-    """一轮采集的运行期控制块；暂停时从注册表摘除并换代 run_id。"""
+class RoundStale(Exception):
+    """内部信号：本轮代际已失效（暂停/恢复换代）。
 
-    def __init__(self, task_id: str, run_id: str) -> None:
-        self.task_id = task_id
-        self.run_id = run_id
+    携带该异常的协程必须立即结束本轮：不再发请求、不写库、不重试。
+    """
+
+
+class TaskSlots:
+    """每任务一份的在途名额，跨暂停/恢复的所有轮次共享。
+
+    旧轮次尚未返回的请求继续占用名额，直到 HTTP 结束才释放；
+    新一轮只有等到空位才能发请求，因此公示站侧观测到的单任务
+    并发任何时刻 <= MAX_INFLIGHT，进度里的 inflight 也读这份计数。
+    """
+
+    def __init__(self) -> None:
         self.semaphore = asyncio.Semaphore(config.MAX_INFLIGHT)
         self.inflight = 0
+
+
+class TaskControl:
+    """一轮采集的运行期控制块；暂停时从注册表摘除并换代 run_id。
+
+    slots 指向所属任务的共享名额，不随轮次更换。
+    """
+
+    def __init__(self, task_id: str, run_id: str, slots: TaskSlots) -> None:
+        self.task_id = task_id
+        self.run_id = run_id
+        self.slots = slots
 
 
 class CollectorEngine:
     def __init__(self) -> None:
         # task_id -> 当前代际控制块
         self._controls: dict[str, TaskControl] = {}
+        # task_id -> 跨轮次共享的在途名额（只在引擎启动/关闭时清空，
+        # 暂停/恢复绝不动它，否则旧轮次未结束的请求就丢了名额）
+        self._slots: dict[str, TaskSlots] = {}
         # 每任务的启动/恢复互斥锁（按事件循环懒创建，见 _lock_for）
         self._resume_locks: dict[str, asyncio.Lock] = {}
         # 串行化所有 SQLite 写操作（配合 run_id 检查，消除检查-写入竞态）
@@ -70,6 +101,8 @@ class CollectorEngine:
         self._registry_lock = asyncio.Lock()
         self._resume_locks.clear()
         self._controls.clear()
+        # 进程重启后旧连接已不存在，在途名额从零开始重新计
+        self._slots.clear()
         self._client = None
         self._client_loop = loop
         # 进程重启：未正常结束的 running 任务标 interrupted，等待人工恢复
@@ -84,6 +117,7 @@ class CollectorEngine:
         self._registry_lock = None
         self._resume_locks.clear()
         self._controls.clear()
+        self._slots.clear()
 
     def _get_client(self) -> httpx.AsyncClient:
         loop = asyncio.get_running_loop()
@@ -98,6 +132,17 @@ class CollectorEngine:
         if task_id not in self._resume_locks:
             self._resume_locks[task_id] = asyncio.Lock()
         return self._resume_locks[task_id]
+
+    def _slots_for(self, task_id: str) -> TaskSlots:
+        """取任务的共享在途名额；没有则创建（如进程重启后首次恢复）。
+
+        同一任务在引擎生命周期内只会有同一份名额，暂停/恢复绝不重建，
+        否则旧轮次未结束的请求就丢了名额（缺陷根因）。
+        """
+        slots = self._slots.get(task_id)
+        if slots is None:
+            slots = self._slots[task_id] = TaskSlots()
+        return slots
 
     @property
     def write_lock(self) -> asyncio.Lock:
@@ -126,16 +171,25 @@ class CollectorEngine:
     async def _http_get_json(
         self, control: TaskControl, url: str, params: Optional[dict] = None
     ) -> Any:
-        """带每任务在途上限的 GET JSON，在途请求任何时刻不超过 MAX_INFLIGHT。"""
+        """带每任务在途上限的 GET JSON，在途请求任何时刻不超过 MAX_INFLIGHT。
+
+        名额来自任务级共享信号量：旧轮次未返回的请求仍占着名额，新一轮
+        只能等空位。拿到名额后、真正发请求前再做一次代际校验——若等待
+        名额期间任务被暂停/换代，则放弃这次发送（RoundStale），保证
+        暂停响应返回后旧轮次不会再发出新请求。
+        """
         client = self._get_client()
-        async with control.semaphore:
-            control.inflight += 1
+        slots = control.slots
+        async with slots.semaphore:
+            if not await self._is_current(control.task_id, control.run_id):
+                raise RoundStale()
+            slots.inflight += 1
             try:
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
                 return resp.json()
             finally:
-                control.inflight -= 1
+                slots.inflight -= 1
 
     # ---------------------------------------------------------- 启动/暂停/恢复
 
@@ -156,7 +210,7 @@ class CollectorEngine:
                     "updated_at": sqlite_now(),
                 }
             )
-            control = TaskControl(task_id, run_id)
+            control = TaskControl(task_id, run_id, self._slots_for(task_id))
             async with self.registry_lock:
                 self._controls[task_id] = control
             asyncio.create_task(self._run_round(task_id, run_id))
@@ -220,7 +274,7 @@ class CollectorEngine:
                         "updated_at": sqlite_now(),
                     },
                 )
-            control = TaskControl(task_id, run_id)
+            control = TaskControl(task_id, run_id, self._slots_for(task_id))
             async with self.registry_lock:
                 self._controls[task_id] = control
             asyncio.create_task(self._run_round(task_id, run_id))
@@ -236,8 +290,10 @@ class CollectorEngine:
         success = await db.count_permits(task_id, "success")
         failed = await db.count_permits(task_id, "failed")
         pending = await db.count_permits(task_id, "pending")
-        control = await self._current_control(task_id)
-        inflight = control.inflight if control else 0
+        # 在途数读任务级共享名额：暂停后旧轮次尚未返回的请求仍被计入，
+        # 恢复后新旧轮次合计也不超过 MAX_INFLIGHT
+        slots = self._slots.get(task_id)
+        inflight = slots.inflight if slots is not None else 0
         return {
             "task_id": task_id,
             "status": task["status"],
@@ -262,11 +318,16 @@ class CollectorEngine:
         """一轮完整采集：拉目录（已完成页跳过）-> 并发补采未成功详情。"""
         task = await db.get_task(task_id)
         base_url = task["target_url"].rstrip("/")
+        # 只认本轮自己的控制块：若注册表里已是更新一代，本轮直接退出，
+        # 避免旧轮次拿着新一轮的控制块继续发请求
+        control = await self._current_control(task_id)
+        if control is None or control.run_id != run_id:
+            return
         try:
-            await self._collect_catalog(task_id, run_id, base_url)
+            await self._collect_catalog(task_id, run_id, control, base_url)
             if not await self._is_current(task_id, run_id):
                 return
-            await self._collect_details(task_id, run_id, base_url)
+            await self._collect_details(task_id, run_id, control, base_url)
             if not await self._is_current(task_id, run_id):
                 return
 
@@ -305,7 +366,9 @@ class CollectorEngine:
                 if control is not None and control.run_id == run_id:
                     self._controls.pop(task_id, None)
 
-    async def _collect_catalog(self, task_id: str, run_id: str, base_url: str) -> None:
+    async def _collect_catalog(
+        self, task_id: str, run_id: str, control: TaskControl, base_url: str
+    ) -> None:
         """逐页拉目录并入库；已完成的页跳过（重启/恢复只补未成功项）。"""
         task = await db.get_task(task_id)
         done_pages = task["catalog_pages_done"] or 0
@@ -313,8 +376,6 @@ class CollectorEngine:
         # 目录此前已完整抓完（含进程重启后恢复）：直接跳过，不再请求越界页
         if total_pages is not None and done_pages >= total_pages:
             return
-        control = await self._current_control(task_id)
-        assert control is not None
         page = done_pages + 1
         while True:
             if not await self._is_current(task_id, run_id):
@@ -328,6 +389,8 @@ class CollectorEngine:
                         control, f"{base_url}/api/permits", params={"page": page}
                     )
                     break
+                except RoundStale:
+                    return  # 等名额期间被暂停/换代：不再发请求，本轮结束
                 except Exception as exc:  # noqa: BLE001 - 重试后上抛
                     last_error = exc
                     await asyncio.sleep(0.05 * (attempt + 1))
@@ -356,10 +419,10 @@ class CollectorEngine:
                 return
             page += 1
 
-    async def _collect_details(self, task_id: str, run_id: str, base_url: str) -> None:
-        """并发采集详情，每任务在途请求受信号量约束（默认上限 2）。"""
-        control = await self._current_control(task_id)
-        assert control is not None
+    async def _collect_details(
+        self, task_id: str, run_id: str, control: TaskControl, base_url: str
+    ) -> None:
+        """并发采集详情，每任务在途请求受共享名额约束（默认上限 2）。"""
         unfinished = await db.list_unfinished_permits(task_id)
         if not unfinished:
             return
@@ -403,6 +466,8 @@ class CollectorEngine:
             try:
                 payload = await self._http_get_json(control, url)
                 break
+            except RoundStale:
+                return  # 等名额期间被暂停/换代：不再发请求
             except httpx.HTTPStatusError as exc:
                 last_error = f"HTTP {exc.response.status_code}"
             except httpx.HTTPError as exc:

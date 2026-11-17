@@ -6,6 +6,10 @@
   之后自动清除，用来演示“失败留待重试，恢复后补采成功”）
 
 无需访问任何外网。
+
+`create_app()` 工厂每次返回独立 ControlState 的应用实例，便于测试
+同时起两个互不影响的模拟站（验证不同采集任务各自限流）；
+模块级 `app` 供 uvicorn/Docker 直接使用。
 """
 
 from __future__ import annotations
@@ -55,92 +59,90 @@ class ControlState:
         }
 
 
-state = ControlState()
+def create_app() -> FastAPI:
+    """创建一个带独立控制状态的模拟站应用。"""
+    state = ControlState()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+
+    app = FastAPI(title="模拟施工许可公示站", version="1.0.0", lifespan=lifespan)
+
+    @app.get("/health")
+    async def health() -> dict:
+        return {"status": "ok"}
+
+    @app.get("/api/permits")
+    async def list_permits(page: int = 1) -> dict:
+        state.enter_request()
+        try:
+            state.catalog_requests += 1
+            result = data.catalog_page(page)
+            if result is None:
+                raise HTTPException(status_code=404, detail=f"page {page} not found")
+            return result
+        finally:
+            state.leave_request()
+
+    @app.get("/api/permits/details/{detail_id}")
+    async def get_detail(detail_id: str) -> dict:
+        state.enter_request()
+        try:
+            state.detail_requests += 1
+            # 可控延迟，便于演示暂停时仍有在途请求的场景
+            if state.delay:
+                await asyncio.sleep(state.delay)
+
+            # 首次失败：命中后只失败一次，随后自动恢复，等待采集端重试
+            if state.first_fail_detail_id == detail_id:
+                state.first_fail_detail_id = None
+                attempt = {
+                    "detail_id": detail_id,
+                    "at": time.time(),
+                    "reason": "simulated first-attempt failure",
+                }
+                state.failed_attempts.append(attempt)
+                raise HTTPException(status_code=500, detail=attempt["reason"])
+
+            result = data.detail(detail_id)
+            if result is None:
+                raise HTTPException(status_code=404, detail=f"detail {detail_id} not found")
+            return result
+        finally:
+            state.leave_request()
+
+    @app.post("/control/reset")
+    async def control_reset() -> dict:
+        """重置所有控制项与统计计数器。"""
+        state.delay = 0.0
+        state.first_fail_detail_id = None
+        state.inflight = 0
+        state.max_inflight = 0
+        state.catalog_requests = 0
+        state.detail_requests = 0
+        state.failed_attempts.clear()
+        return {"status": "reset"}
+
+    @app.post("/control/delay")
+    async def control_delay(seconds: float) -> dict:
+        if seconds < 0:
+            raise HTTPException(status_code=400, detail="seconds must be >= 0")
+        state.delay = seconds
+        return {"delay": state.delay}
+
+    @app.post("/control/first-fail")
+    async def control_first_fail(detail_id: str) -> dict:
+        if data.detail(detail_id) is None:
+            raise HTTPException(status_code=404, detail=f"unknown detail_id {detail_id}")
+        state.first_fail_detail_id = detail_id
+        return {"first_fail_detail_id": state.first_fail_detail_id}
+
+    @app.get("/control/state")
+    async def control_state() -> dict:
+        return state.snapshot()
+
+    return app
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-
-
-app = FastAPI(title="模拟施工许可公示站", version="1.0.0", lifespan=lifespan)
-
-
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok"}
-
-
-@app.get("/api/permits")
-async def list_permits(page: int = 1) -> dict:
-    state.enter_request()
-    try:
-        state.catalog_requests += 1
-        result = data.catalog_page(page)
-        if result is None:
-            raise HTTPException(status_code=404, detail=f"page {page} not found")
-        return result
-    finally:
-        state.leave_request()
-
-
-@app.get("/api/permits/details/{detail_id}")
-async def get_detail(detail_id: str) -> dict:
-    state.enter_request()
-    try:
-        state.detail_requests += 1
-        # 可控延迟，便于演示暂停时仍有在途请求的场景
-        if state.delay:
-            await asyncio.sleep(state.delay)
-
-        # 首次失败：命中后只失败一次，随后自动恢复，等待采集端重试
-        if state.first_fail_detail_id == detail_id:
-            state.first_fail_detail_id = None
-            attempt = {
-                "detail_id": detail_id,
-                "at": time.time(),
-                "reason": "simulated first-attempt failure",
-            }
-            state.failed_attempts.append(attempt)
-            raise HTTPException(status_code=500, detail=attempt["reason"])
-
-        result = data.detail(detail_id)
-        if result is None:
-            raise HTTPException(status_code=404, detail=f"detail {detail_id} not found")
-        return result
-    finally:
-        state.leave_request()
-
-
-@app.post("/control/reset")
-async def control_reset() -> dict:
-    """重置所有控制项与统计计数器。"""
-    state.delay = 0.0
-    state.first_fail_detail_id = None
-    state.inflight = 0
-    state.max_inflight = 0
-    state.catalog_requests = 0
-    state.detail_requests = 0
-    state.failed_attempts.clear()
-    return {"status": "reset"}
-
-
-@app.post("/control/delay")
-async def control_delay(seconds: float) -> dict:
-    if seconds < 0:
-        raise HTTPException(status_code=400, detail="seconds must be >= 0")
-    state.delay = seconds
-    return {"delay": state.delay}
-
-
-@app.post("/control/first-fail")
-async def control_first_fail(detail_id: str) -> dict:
-    if data.detail(detail_id) is None:
-        raise HTTPException(status_code=404, detail=f"unknown detail_id {detail_id}")
-    state.first_fail_detail_id = detail_id
-    return {"first_fail_detail_id": state.first_fail_detail_id}
-
-
-@app.get("/control/state")
-async def control_state() -> dict:
-    return state.snapshot()
+app = create_app()

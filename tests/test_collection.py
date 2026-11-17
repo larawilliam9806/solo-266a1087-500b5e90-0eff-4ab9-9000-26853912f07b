@@ -55,6 +55,77 @@ async def test_max_inflight_limit(client, mock_base_url):
     assert state["max_inflight"] == 2, "延迟下应观察到 2 并发"
 
 
+# 2b. 缺陷回归：慢响应下连续暂停/恢复，在途请求任何时刻 <= 2，且进度计入旧轮次
+
+async def test_inflight_limit_across_pause_resume(client, mock_base_url):
+    """跨多次暂停/恢复，单任务未结束请求 <= 2；旧请求未返回仍占名额。
+
+    缺陷原貌：每轮采集各持一把信号量，暂停/恢复后旧轮次在途请求被
+    “遗忘”，新一轮重新拿满 2 个名额，公示站实际并发随暂停次数翻倍，
+    而进度 inflight 始终只显示当前轮（<=2）。
+    """
+    _api, engine, db, _ = client
+    async with httpx.AsyncClient(base_url=mock_base_url, timeout=10) as mock_http:
+        await mock_http.post("/control/delay", params={"seconds": 0.6})
+        task_id = await _start(engine, mock_base_url)
+        await wait_until(lambda: _success_at_least(engine, task_id, 1))
+
+        inflight_when_paused = []
+        for _ in range(3):  # 连续多次 暂停 -> 立即恢复（不等旧请求结束）
+            paused = await engine.pause_task(task_id)
+            assert paused["status"] == "paused"
+            prog = await engine.get_progress(task_id)
+            assert 0 <= prog["inflight"] <= 2
+            inflight_when_paused.append(prog["inflight"])
+
+            resumed = await engine.resume_task(task_id)  # 立即受理
+            assert resumed["status"] == "running"
+            prog = await engine.get_progress(task_id)
+            assert prog["inflight"] <= 2, "恢复后在途数（含旧轮次）超过上限"
+            await asyncio.sleep(0.15)  # 让新一轮开始争抢名额
+
+        # 暂停瞬间进度必须仍计入旧轮次在途请求（公示站还没返回的那些）
+        assert any(n >= 1 for n in inflight_when_paused), (
+            f"暂停时进度未计入旧轮次在途请求: {inflight_when_paused}"
+        )
+
+        final = await poll_progress(engine, task_id, {"completed", "failed"}, timeout=60)
+        assert final["status"] == "completed"
+        assert final["success"] == 35
+        state = (await mock_http.get("/control/state")).json()
+        assert state["max_inflight"] <= 2, (
+            f"连续暂停/恢复期间公示站观测到峰值在途 {state['max_inflight']}，超过 2"
+        )
+
+
+# 2c. 不同任务各自限流：两任务并行，各自峰值 <= 2（合计可到 4）-------------
+
+async def test_tasks_rate_limited_independently(client, mock_base_url, mock_base_url_2):
+    _api, engine, db, _ = client
+    async with httpx.AsyncClient(base_url=mock_base_url, timeout=10) as m1, (
+        httpx.AsyncClient(base_url=mock_base_url_2, timeout=10)
+    ) as m2:
+        await m1.post("/control/reset")
+        await m2.post("/control/reset")
+        await m1.post("/control/delay", params={"seconds": 0.3})
+        await m2.post("/control/delay", params={"seconds": 0.3})
+
+        id1 = await _start(engine, mock_base_url)
+        id2 = await _start(engine, mock_base_url_2)
+        prog1, prog2 = await asyncio.gather(
+            poll_progress(engine, id1, {"completed", "failed"}),
+            poll_progress(engine, id2, {"completed", "failed"}),
+        )
+        assert prog1["status"] == prog2["status"] == "completed"
+        assert prog1["success"] == prog2["success"] == 35
+        s1 = (await m1.get("/control/state")).json()
+        s2 = (await m2.get("/control/state")).json()
+
+    # 两个任务同时跑满各自的名额：说明限流是每任务而非全局
+    assert s1["max_inflight"] == 2, f"任务1峰值在途 {s1['max_inflight']}"
+    assert s2["max_inflight"] == 2, f"任务2峰值在途 {s2['max_inflight']}"
+
+
 # 3. 暂停后不得继续写入；随即恢复后迟到响应也不能改记录/进度 ----------------
 
 async def test_pause_stops_writes_and_late_response_rejected(client, mock_base_url):
@@ -113,7 +184,7 @@ async def test_stale_run_id_write_rejected_after_resume(client, mock_base_url):
         assert new_control is not None and new_control.run_id == new_run_id
 
         # 构造一个“上一轮”的控制块（旧 run_id），直接走单条详情写入路径
-        stale_control = type(new_control)(task_id, "stale-run-id")
+        stale_control = type(new_control)(task_id, "stale-run-id", new_control.slots)
         fake_detail = {
             "permit_no": stale_row["permit_no"],
             "project_name": "被污染的项目名",
