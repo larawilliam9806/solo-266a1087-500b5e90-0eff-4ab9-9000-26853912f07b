@@ -1,0 +1,53 @@
+services:
+  mock-site:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.collector
+    environment:
+      MOCK_BASE_URL: http://mock-site:8001
+      DB_PATH: /data/collector.db
+      MAX_INFLIGHT: "2"
+    ports:
+      - "8000:8000"
+    volumes:
+      - collector-data:/data
+    depends_on:
+      mock-site:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  demo:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: Dockerfile.collector
+    environment:
+      COLLECTOR_URL: http://collector:8000
+      MOCK_SITE_URL: http://mock-site:8001
+    depends_on:
+      collector:
+        condition: service_healthy
+      mock-site:
+        condition: service_healthy
+    volumes:
+      - ./demo:/demo:ro
+    entrypoint: ["python", "/demo/demo.py"]
+
+volumes:
+  collector-data:
